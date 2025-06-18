@@ -1,113 +1,177 @@
 <?php
-/**
- * API: Get Game State
- *
- * Phase 1: Database Foundation (implements 'waiting' state)
- * The most critical endpoint for real-time updates. Clients will poll this
- * endpoint every few seconds to get the latest state of the game.
- *
- * --- REQUEST ---
- * Method: GET
- * URL: /api/get_game_state.php?session_code=XYZ123
- *
- * --- RESPONSE (Waiting State) ---
- * {
- * "success": true,
- * "game_state": {
- * "status": "waiting",
- * "session_name": "My Awesome Trivia Night",
- * "player_count": 3,
- * "players": ["Alice", "Bob", "Charlie"]
- * },
- * "timestamp": 1678886400
- * }
- *
- * --- ERROR RESPONSES ---
- * 400 Bad Request: Missing session_code.
- * 404 Not Found: Session code does not exist.
- * 500 Internal Server Error: Database issue.
- */
+// api/get_game_state.php
 
-header("Content-Type: application/json");
-header("Access-Control-Allow-Origin: *");
+require_once '../includes/session_manager.php';
+require_once '../includes/game_logic.php'; // Needed for getQuestion, getCorrectAnswer, getLeaderboard, getTotalQuestions
+require_once '../config/database.php';    // For $pdo
+require_once '../config/settings.php';    // For default_time_per_question
+require_once '../includes/functions.php';   // For sendJsonError and sendJsonResponse
 
-require_once __DIR__ . '/../config/database.php';
-require_once __DIR__ . '/../includes/functions.php';
+header('Content-Type: application/json');
+date_default_timezone_set('UTC'); // Ensure consistent time handling
 
-if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-    sendJsonError('METHOD_NOT_ALLOWED', 'This endpoint only accepts GET requests.', 405);
+// Get PDO instance
+try {
+    $pdo = getDbConnection();
+} catch (PDOException $e) {
+    sendJsonError('DATABASE_ERROR', 'Database connection failed: ' . $e->getMessage(), 500);
+    exit;
 }
 
-// --- 1. Validate Input ---
-$sessionCode = strtoupper(trim($_GET['session_code'] ?? ''));
+$sessionManager = new SessionManager($pdo);
+$gameLogic = new GameLogic($pdo); // Instantiate GameLogic
+
+if (!isset($_GET['session_code'])) {
+    sendJsonError('MISSING_PARAMETERS', 'Required parameter: session_code.', 400);
+    exit;
+}
+
+$sessionCode = trim($_GET['session_code']);
+$playerName = isset($_GET['player_name']) ? trim($_GET['player_name']) : null; // Optional, for player-specific state
 
 if (empty($sessionCode)) {
-    sendJsonError('MISSING_SESSION_CODE', 'The session_code parameter is required.', 400);
-}
-if (!isValidSessionCodeFormat($sessionCode)) {
-    sendJsonError('INVALID_SESSION_CODE_FORMAT', 'Session code format is invalid.', 400);
+    sendJsonError('INVALID_INPUT', 'session_code cannot be empty.', 400);
+    exit;
 }
 
-try {
-    // --- 2. Fetch Core Game Session Info ---
-    $stmt = $pdo->prepare("SELECT session_name, status, updated_at FROM game_sessions WHERE session_code = ?");
-    $stmt->execute([$sessionCode]);
-    $session = $stmt->fetch();
+$session = $sessionManager->getSession($sessionCode);
+if (!$session) {
+    sendJsonError('SESSION_NOT_FOUND', 'Session not found.', 404);
+    exit;
+}
 
-    if (!$session) {
-        sendJsonError('SESSION_NOT_FOUND', 'The requested game session does not exist.', 404);
+$gameState = [
+    'status' => $session['status'],
+];
+$response = ['success' => true, 'game_state' => $gameState, 'timestamp' => time()];
+
+// Fetch player-specific data if player_name is provided
+$playerData = null;
+if ($playerName) {
+    $playerData = $sessionManager->getPlayer($sessionCode, $playerName);
+    if (!$playerData) {
+        // Optional: could error here, or just proceed without player-specific info
+        // For now, let's allow it, player might be joining or mis-typed name
     }
+}
 
-    // Prepare the base response structure
-    $response = [
-        'success' => true,
-        'game_state' => [
-            'status' => $session['status'],
-        ],
-        // The timestamp allows the client to check if data has actually changed
-        'timestamp' => strtotime($session['updated_at']) 
-    ];
+// Fetch time_per_question from settings
+$settingsStmt = $pdo->query("SELECT time_per_question FROM settings LIMIT 1");
+$settings = $settingsStmt->fetch(PDO::FETCH_ASSOC);
+$timePerQuestion = $settings ? (int)$settings['time_per_question'] : DEFAULT_TIME_PER_QUESTION;
 
-    // --- 3. Build State-Specific Response ---
-    // This switch will be expanded in later phases. For Phase 1, we only need 'waiting'.
-    switch ($session['status']) {
-        case 'waiting':
-            // For the waiting state, we need the list of joined players.
-            $playerStmt = $pdo->prepare("SELECT player_name FROM players WHERE session_code = ? ORDER BY joined_at ASC");
-            $playerStmt->execute([$sessionCode]);
-            $players = $playerStmt->fetchAll(PDO::FETCH_COLUMN, 0); // Fetch all names into a simple array
+switch ($session['status']) {
+    case 'waiting':
+        $response['game_state']['players'] = $sessionManager->getPlayers($sessionCode);
+        $response['game_state']['host_email'] = $session['host_email']; // Useful for host UI
+        $response['game_state']['game_title'] = $session['game_title']; // Useful for display
+        break;
 
-            $response['game_state']['session_name'] = $session['session_name'];
-            $response['game_state']['player_count'] = count($players);
-            $response['game_state']['players'] = $players;
-            $response['game_state']['message'] = "Waiting for the host to start the game...";
-            break;
+    case 'active':
+        $currentQuestionNumber = (int)$session['current_question'];
+        $questionData = $gameLogic->getQuestion($currentQuestionNumber);
 
-        case 'active':
-            // To be implemented in Phase 2
-            $response['game_state']['message'] = "Game is active.";
-            break;
+        if (!$questionData) {
+            sendJsonError('QUESTION_NOT_FOUND', "Active question {$currentQuestionNumber} not found.", 500);
+            exit;
+        }
 
-        case 'completed':
-            // To be implemented in Phase 2
-            $response['game_state']['message'] = "Game has been completed.";
-            break;
+        $timeRemaining = 0;
+        if (!empty($session['question_start_time'])) {
+            $questionStartTime = new DateTime($session['question_start_time']);
+            $currentTime = new DateTime();
+            $elapsed = $currentTime->getTimestamp() - $questionStartTime->getTimestamp();
+            $timeRemaining = max(0, $timePerQuestion - $elapsed);
+        }
         
-        default:
-            // Handle other potential states like 'paused'
-             $response['game_state']['message'] = "Game is in an intermediate state.";
-            break;
-    }
+        $playerHasAnswered = false;
+        if ($playerData && !empty($playerData['current_answer'])) {
+            // Check if current_answer corresponds to the current question.
+            // This requires knowing which question current_answer was for.
+            // Let's assume 'current_answer' is reset or managed by submitAnswer logic
+            // to only be relevant for the current question.
+            // A more robust way would be to check question_responses table for current question.
+            $answeredStmt = $pdo->prepare("SELECT COUNT(*) FROM question_responses WHERE session_code = :sc AND player_name = :pn AND question_id = :qid");
+            $answeredStmt->execute([':sc' => $sessionCode, ':pn' => $playerName, ':qid' => $questionData['id']]);
+            if ($answeredStmt->fetchColumn() > 0) {
+                $playerHasAnswered = true;
+            }
+        }
 
-    // --- 4. Send the final response ---
-    sendJsonResponse($response, 200);
 
-} catch (PDOException $e) {
-    sendJsonError(
-        'DATABASE_ERROR',
-        'A database error occurred while fetching the game state.',
-        500,
-        $e->getMessage()
-    );
+        $response['game_state']['current_question'] = $currentQuestionNumber;
+        $response['game_state']['total_questions'] = $gameLogic->getTotalQuestions();
+        $response['game_state']['time_remaining'] = $timeRemaining;
+        $response['game_state']['question'] = [
+            'id' => $questionData['id'],
+            'text' => $questionData['question_text'],
+            'answers' => $questionData['answers'] // Already an array from getQuestion
+        ];
+        $response['game_state']['player_answered'] = $playerHasAnswered; // Player specific
+        $response['game_state']['show_results'] = false; // Not showing results in 'active' state
+        break;
+
+    case 'results':
+        // This state means we are showing results for a specific question.
+        // The host_controls.php sets `show_results_for_question` in game_sessions.
+        $resultsQuestionNumber = (int)$session['show_results_for_question'];
+        if ($resultsQuestionNumber == 0) {
+             sendJsonError('INVALID_STATE', "Results state active but no question specified for results.", 500);
+            exit;
+        }
+
+        $questionData = $gameLogic->getQuestion($resultsQuestionNumber);
+        if (!$questionData) {
+            sendJsonError('QUESTION_NOT_FOUND', "Question {$resultsQuestionNumber} for results not found.", 500);
+            exit;
+        }
+        $correctAnswer = $gameLogic->getCorrectAnswer($resultsQuestionNumber);
+
+        // Time remaining is not strictly relevant here, but question_start_time might be from when it was active.
+        // For simplicity, let's set time_remaining to 0 or not include it.
+        // Or, it could be the time left when the question ended. For now, 0.
+        $timeRemaining = 0; // Or calculate how much time was left if that's desired.
+
+        $playerAnswerData = null;
+        if ($playerName) {
+             $qrStmt = $pdo->prepare("SELECT submitted_answer FROM question_responses WHERE session_code = :sc AND player_name = :pn AND question_id = :qid");
+             $qrStmt->execute([':sc' => $sessionCode, ':pn' => $playerName, ':qid' => $questionData['id']]);
+             $playerAnswerData = $qrStmt->fetch(PDO::FETCH_ASSOC);
+        }
+
+
+        $response['game_state']['current_question'] = $resultsQuestionNumber; // The question whose results are being shown
+        $response['game_state']['total_questions'] = $gameLogic->getTotalQuestions();
+        $response['game_state']['time_remaining'] = $timeRemaining; // Typically 0 in results phase
+        $response['game_state']['question'] = [
+            'id' => $questionData['id'],
+            'text' => $questionData['question_text'],
+            'answers' => $questionData['answers'],
+            'correct_answer' => $correctAnswer // Key addition for 'results' state
+        ];
+        // Player specific details for results state:
+        if ($playerData) {
+            $response['game_state']['player_submitted_answer'] = $playerAnswerData ? $playerAnswerData['submitted_answer'] : null;
+        }
+        $response['game_state']['player_answered'] = true; // In results phase, effectively everyone has "answered" or time is up
+        $response['game_state']['show_results'] = true;
+
+        // Optionally, include all responses for this question for all players (for host or full transparency)
+        // $allResponsesStmt = $pdo->prepare("SELECT player_name, submitted_answer, is_correct FROM question_responses WHERE session_code = :sc AND question_id = :qid");
+        // $allResponsesStmt->execute([':sc' => $sessionCode, ':qid' => $questionData['id']]);
+        // $response['game_state']['all_player_responses'] = $allResponsesStmt->fetchAll(PDO::FETCH_ASSOC);
+        break;
+
+    case 'completed':
+        $response['game_state']['message'] = "The game has ended. Here is the final leaderboard.";
+        $response['game_state']['leaderboard'] = $gameLogic->getLeaderboard($sessionCode);
+        break;
+
+    default:
+        sendJsonError('UNKNOWN_GAME_STATE', "Unknown game state: {$session['status']}", 500);
+        exit;
 }
 
+sendJsonResponse($response);
+
+?>
